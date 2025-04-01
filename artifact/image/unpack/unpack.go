@@ -16,7 +16,6 @@
 package unpack
 
 import (
-	"archive/tar"
 	"bytes"
 	"errors"
 	"fmt"
@@ -26,6 +25,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"archive/tar"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/osv-scalibr/artifact/image/require"
@@ -289,6 +290,40 @@ func (u *Unpacker) UnpackLayers(dir string, image v1.Image) ([]string, error) {
 	return layerDigests, nil
 }
 
+// pathOutsideBaseDirectory checks that the fullPath is within the base directory even after
+// evaluating symlinks. This is to prevent symlinks from escaping the base directory and
+// writing files outside of it.
+// TODO: b/407782695 - Figure out why safeopen.WriteFileBeneath didn't work. The suggestion from the
+// Go community is to use the safeopen package, however, our tests wouldn't pass when using the
+// safeopen.WriteFileBeneath function. More investigation is needed here.
+func pathOutsideBaseDirectory(baseDir, fullPath string) bool {
+	parentDir := filepath.Dir(fullPath)
+
+	// Resolve any symlinks in the parent directory. This is to ensure that the parent directory is
+	// within baseDir.
+	resolvedParentDir, err := filepath.EvalSymlinks(parentDir)
+	if err != nil {
+		log.Warnf("failed to resolve symlinks in parent directory: %w", err)
+		return true
+	}
+
+	// The resolved parent directory might still have relative components, so the absolute path is
+	// needed again.
+	canonicalParentDir, err := filepath.Abs(resolvedParentDir)
+	if err != nil {
+		log.Warnf("failed to get canonical path of parent directory: %w", err)
+		return true
+	}
+
+	// Check if the resolved parent directory is within baseDir. If canonicalParentDir is not within
+	// baseDir, then the relative path will be something like `../..`, which is not allowed.
+	if relPath, err := filepath.Rel(baseDir, canonicalParentDir); err != nil || strings.HasPrefix(relPath, "..") {
+		return true
+	}
+
+	return false
+}
+
 func unpack(dir string, reader io.Reader, symlinkResolution SymlinkResolution, symlinkErrStrategy SymlinkErrStrategy, requirer require.FileRequirer, requiredTargets map[string]bool, finalPass bool, maxSizeBytes int64) (map[string]bool, error) {
 	tarReader := tar.NewReader(reader)
 
@@ -361,6 +396,14 @@ func unpack(dir string, reader io.Reader, symlinkResolution SymlinkResolution, s
 
 			// Retain the original file permission but update it so we can always read and write the file.
 			modeWithOwnerReadWrite := header.FileInfo().Mode() | 0600
+
+			// Make sure files are written under dir. This is to prevent symlinks from escaping dir and
+			// writing files outside of the directory.
+			if pathOutsideBaseDirectory(dir, fullPath) {
+				log.Errorf("attempted to write file %q outside of base directory %q", fullPath, dir)
+				continue
+			}
+
 			err = os.WriteFile(fullPath, content, modeWithOwnerReadWrite)
 			if err != nil {
 				log.Errorf("failed to write regular file %q: %v", fullPath, err)
